@@ -6,6 +6,13 @@ import re
 from urllib.parse import urlparse
 import logging
 from typing import List, Dict, Optional, Tuple
+from selenium import webdriver
+from selenium.webdriver.chrome.options import Options
+from selenium.webdriver.chrome.service import Service
+from selenium.webdriver.common.by import By
+from selenium.webdriver.support.ui import WebDriverWait
+from selenium.webdriver.support import expected_conditions as EC
+from webdriver_manager.chrome import ChromeDriverManager
 
 # Set up logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -85,11 +92,47 @@ class CompetitorPriceScraper:
         if competitor_name == 'Metro':
             logger.info(f"Debug: Analyzing Metro page structure")
             
-            # Use the specific Metro price class found by user
-            price_tag = soup.find("p", class_="CategoryGrid_product_details_price__dNQ0Q")
+            # First, try to extract price from JSON data in script tags (Metro stores prices here)
+            scripts = soup.find_all('script')
+            for script in scripts:
+                script_text = script.get_text()
+                if script_text:
+                    # Look for JSON data containing price information
+                    if '"price"' in script_text and '"sell_price"' in script_text:
+                        logger.info(f"Debug: Found Metro JSON data with prices")
+                        # Extract price from JSON
+                        price_match = re.search(r'"price":(\d+(?:\.\d+)?)', script_text)
+                        sell_price_match = re.search(r'"sell_price":(\d+(?:\.\d+)?)', script_text)
+                        
+                        if sell_price_match:
+                            price = sell_price_match.group(1)
+                            logger.info(f"Debug: Found Metro sell_price: {price}")
+                            if self.is_valid_price(price):
+                                return self.format_price(price)
+                        
+                        if price_match:
+                            price = price_match.group(1)
+                            logger.info(f"Debug: Found Metro price: {price}")
+                            if self.is_valid_price(price):
+                                return self.format_price(price)
+            
+            # Use the specific Metro price selector path provided by user
+            price_selector = "#__next > div > div.main-container > div > div.CategoryGrid_product_details_container_without_imageCarousel__xOYB6 > div.CategoryGrid_product_details_description_container__OjSn3 > p.CategoryGrid_product_details_price__dNQQQ"
+            price_tag = soup.select_one(price_selector)
+            
             if price_tag:
                 price_text = price_tag.get_text(strip=True)
-                logger.info(f"Debug: Found Metro price tag: '{price_text}'")
+                logger.info(f"Debug: Found Metro price using specific selector: '{price_text}'")
+                price = self.extract_price_from_text(price_text)
+                if price and self.is_valid_price(price):
+                    logger.info(f"Debug: Found Metro price: {price}")
+                    return self.format_price(price)
+            
+            # Also try the shorter class name as fallback
+            price_tag = soup.find("p", class_="CategoryGrid_product_details_price__dNQQQ")
+            if price_tag:
+                price_text = price_tag.get_text(strip=True)
+                logger.info(f"Debug: Found Metro price using class selector: '{price_text}'")
                 price = self.extract_price_from_text(price_text)
                 if price and self.is_valid_price(price):
                     logger.info(f"Debug: Found Metro price: {price}")
@@ -285,10 +328,15 @@ class CompetitorPriceScraper:
                     logger.info(f"Waiting {delay} seconds before retry...")
                     time.sleep(delay)
                 
-                response = self.session.get(url, timeout=45)  # Increased timeout
-                response.raise_for_status()
-                
-                price = self.extract_price_from_html(response.text, competitor_name)
+                # For Metro, use Selenium directly
+                if competitor_name == 'Metro':
+                    price = self.get_metro_price_selenium(url)
+                else:
+                    # For other competitors, use requests/BeautifulSoup
+                    response = self.session.get(url, timeout=45)  # Increased timeout
+                    response.raise_for_status()
+                    soup = BeautifulSoup(response.text, 'html.parser')
+                    price = self.get_competitor_price(competitor_name, url, soup)
                 
                 if price:
                     logger.info(f"Found price for {competitor_name}: Rs. {price}")
@@ -453,6 +501,113 @@ class CompetitorPriceScraper:
         """
         logger.warning("This method is deprecated. Use save_competitor_results() instead.")
         pass
+
+    def get_metro_price_selenium(self, url):
+        chrome_options = Options()
+        chrome_options.add_argument('--headless')
+        chrome_options.add_argument('--disable-gpu')
+        chrome_options.add_argument('--no-sandbox')
+        chrome_options.add_argument('--window-size=1920,1080')
+        service = Service(ChromeDriverManager().install())
+        driver = webdriver.Chrome(service=service, options=chrome_options)
+        try:
+            driver.get(url)
+            wait = WebDriverWait(driver, 20)
+            # Try the specific product detail price selector first
+            try:
+                price_elem = wait.until(EC.presence_of_element_located((By.CSS_SELECTOR, 'p.CategoryGrid_product_details_price__dNQQQ')))
+                price_text = price_elem.text.strip()
+                price = self.extract_price_from_text(price_text)
+                if price and self.is_valid_price(price):
+                    return self.format_price(price)
+            except Exception:
+                # Fallback: try all p.CategoryGrid_product_price__Svf8T elements and pick the lowest
+                price_elements = driver.find_elements(By.CSS_SELECTOR, 'p.CategoryGrid_product_price__Svf8T')
+                prices = []
+                for elem in price_elements:
+                    text = elem.text.strip()
+                    price = self.extract_price_from_text(text)
+                    if price and self.is_valid_price(price):
+                        prices.append(float(price))
+                if prices:
+                    min_price = min(prices)
+                    return f"{min_price:.2f}"
+            return None
+        except Exception as e:
+            print(f"Selenium Metro error: {e}")
+            return None
+        finally:
+            driver.quit()
+
+    def get_competitor_price(self, competitor_name, url, soup=None):
+        if competitor_name == 'Metro':
+            return self.get_metro_price_selenium(url)
+        
+        # For other competitors, use the existing BeautifulSoup logic
+        if soup is None:
+            return None
+            
+        # Try competitor-specific selectors first
+        competitor_selectors = {
+            'Cartpk': [
+                '.price', '.product-price', '.price-display', '.price-value',
+                '.product-price-value', '.price-amount', '.product-amount',
+                '.selling-price', '.offer-price', '.discount-price', '.final-price',
+                '.price-box', '.price-container', '.product-price-box',
+                '.price-wrapper', '.price-section', '.product-price-section',
+                '.product-details-price', '.current-price', '.regular-price',
+                '.product-price-display', '.price-text', '.price-label',
+                '[class*="price"]', '[class*="Price"]', '[class*="amount"]',
+                '[class*="Amount"]', '[class*="cost"]', '[class*="Cost"]',
+                '[data-price]', '[data-amount]', '[data-value]',
+                '.cost', '.value', '.product-cost', '.product-value',
+                '.product-details', '.product-info', '.product-summary',
+                '.product-description', '.product-content'
+            ],
+            'Diamond': [
+                '.price', '.product-price', '.price-display', '.price-value',
+                '.product-price-value', '.price-amount', '.product-amount',
+                '.selling-price', '.offer-price', '.discount-price', '.final-price',
+                '.price-box', '.price-container', '.product-price-box',
+                '.price-wrapper', '.price-section', '.product-price-section',
+                '.product-details-price', '.current-price', '.regular-price',
+                '.product-price-display', '.price-text', '.price-label',
+                '[class*="price"]', '[class*="Price"]', '[class*="amount"]',
+                '[class*="Amount"]', '[class*="cost"]', '[class*="Cost"]',
+                '[data-price]', '[data-amount]', '[data-value]',
+                '.cost', '.value', '.product-cost', '.product-value',
+                '.product-details', '.product-info', '.product-summary',
+                '.product-description', '.product-content'
+            ],
+            'Naheed': [
+                '.price', '.product-price', '.price-display', '.price-value',
+                '.product-price-value', '.price-amount', '.product-amount',
+                '.selling-price', '.offer-price', '.discount-price', '.final-price',
+                '.price-box', '.price-container', '.product-price-box',
+                '.price-wrapper', '.price-section', '.product-price-section',
+                '.product-details-price', '.current-price', '.regular-price',
+                '.product-price-display', '.price-text', '.price-label',
+                '[class*="price"]', '[class*="Price"]', '[class*="amount"]',
+                '[class*="Amount"]', '[class*="cost"]', '[class*="Cost"]',
+                '[data-price]', '[data-amount]', '[data-value]',
+                '.cost', '.value', '.product-cost', '.product-value',
+                '.product-details', '.product-info', '.product-summary',
+                '.product-description', '.product-content'
+            ]
+        }
+        
+        if competitor_name in competitor_selectors:
+            for selector in competitor_selectors[competitor_name]:
+                price_elements = soup.select(selector)
+                for element in price_elements:
+                    text = element.get_text(strip=True)
+                    price = self.extract_price_from_text(text)
+                    if price:
+                        return price
+        
+        # Fallback: search entire text for price patterns
+        text = soup.get_text()
+        return self.extract_price_from_text(text)
 
 def main():
     """
