@@ -395,7 +395,7 @@ class CompetitorPriceScraper:
                     logger.error("CSV file doesn't have enough rows")
                     return
                 
-                # Set competitor names in order (excluding Cartpk)
+                # Set competitor names in order (excluding Cartpk as it's your own product)
                 self.competitor_names = ['Diamond', 'Naheed', 'Metro']
                 logger.info(f"Found competitors: {self.competitor_names}")
                 
@@ -416,10 +416,11 @@ class CompetitorPriceScraper:
                         'SKU': sku,
                         'my_price': my_price
                     }
-                    # Skip Cartpk (index 0), start from Diamond (index 1)
+                    
+                    # Add competitor data (skip Cartpk)
                     for i, comp_name in enumerate(self.competitor_names):
                         product_data[f'{comp_name}_price'] = ''
-                        product_data[f'{comp_name}_link'] = links[i+1] if i+1 < len(links) else ''  # +1 to skip Cartpk
+                        product_data[f'{comp_name}_link'] = links[i+1] if i+1 < len(links) else ''
                     self.unified_results.append(product_data)
                 logger.info(f"Created {len(self.unified_results)} product entries")
                 
@@ -444,7 +445,7 @@ class CompetitorPriceScraper:
                             logger.warning(f"Product {sku} not found in unified_results")
                             continue
                         
-                        # Process all competitors (Diamond, Naheed, Metro)
+                        # Process competitor links
                         product_link = existing_product[f'{comp_name}_link']
                         if product_link and product_link.strip() != '':
                             if row_idx > 3:
@@ -496,6 +497,7 @@ class CompetitorPriceScraper:
             # Create table with dynamic columns based on competitors
             columns = ["id INT AUTO_INCREMENT PRIMARY KEY", "SKU VARCHAR(255)", "my_price VARCHAR(50)"]
             
+            # Add competitor columns
             for comp_name in self.competitor_names:
                 columns.append(f"{comp_name}_price VARCHAR(50)")
                 columns.append(f"{comp_name}_link TEXT")
